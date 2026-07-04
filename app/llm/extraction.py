@@ -1,5 +1,5 @@
 from app.config import get_settings
-from app.llm.client import OllamaClient
+from app.llm.client import OpenRouterClient
 from app.llm.schemas import EXTRACTION_SCHEMA
 
 SYSTEM_PROMPT = (
@@ -22,7 +22,7 @@ async def extract_and_score(market_description: str, article_text: str, source_d
         return None
 
     settings = get_settings()
-    client = OllamaClient()
+    client = OpenRouterClient()
     prompt = (
         f"MARKET RESOLUTION CRITERIA:\n{market_description}\n\n"
         f"SOURCE DOMAIN: {source_domain}\n\n"
@@ -34,4 +34,5 @@ async def extract_and_score(market_description: str, article_text: str, source_d
         system=SYSTEM_PROMPT,
         prompt=prompt,
         schema=EXTRACTION_SCHEMA,
+        name="extraction",
     )

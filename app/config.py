@@ -12,11 +12,12 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/murderer"
     redis_url: str = "redis://localhost:6379/0"
 
-    # LLM (Ollama, self-hosted)
-    ollama_host: str = "http://localhost:11434"
-    llm_query_gen_model: str = "qwen3:4b"
-    llm_extraction_model: str = "qwen3:8b"
-    embedding_model: str = "nomic-embed-text"
+    # LLM (OpenRouter — https://openrouter.ai)
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_api_key: str = ""
+    llm_query_gen_model: str = "openai/gpt-4o-mini"
+    llm_extraction_model: str = "openai/gpt-4o-mini"
+    embedding_model: str = "openai/text-embedding-3-small"
     embedding_dim: int = 768
 
     # Security — Fernet key used to encrypt callback_secret at rest.

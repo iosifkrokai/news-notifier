@@ -17,7 +17,7 @@ POST /markets/subscribe ─▶ Postgres (markets)
                                │
         ┌───────────┬──────────┴──────────┬────────────┐
    query-gen     search (GDELT +      Playwright      extraction+
-   (Ollama)      Google News RSS +    scrape          scoring (Ollama)
+   (OpenRouter)  Google News RSS +    scrape          scoring (OpenRouter)
                  DuckDuckGo best-effort)                    │
                                │                       dedup (URL-hash /
                                └──────────────────────▶ simhash / pgvector)
@@ -45,62 +45,44 @@ go out again.
 | Queue / scheduler | arq + Redis |
 | DB + vector store | PostgreSQL + pgvector |
 | Scraping | Playwright (Chromium) |
-| LLM | Ollama — `qwen3:4b` (query generation) + `qwen3:8b` (extraction/scoring) |
-| Embeddings | Ollama — `nomic-embed-text` |
+| LLM | OpenRouter — `openai/gpt-4o-mini` (query generation + extraction/scoring) |
+| Embeddings | OpenRouter — `openai/text-embedding-3-small` (truncated to 768 dims) |
 | Search | GDELT DOC 2.0 API + Google News RSS + DuckDuckGo (best-effort) |
 
-Fully free / self-hosted, English-only markets assumed (see `app/llm/*` system
-prompts and `sourcelang:english` filter in `app/search/gdelt.py`).
+English-only markets assumed (see `app/llm/*` system prompts and
+`sourcelang:english` filter in `app/search/gdelt.py`).
 
 ## Setup (Docker — recommended)
-
-Everything runs in containers, including Ollama.
 
 ```bash
 # 1. Config
 cp .env.example .env
 python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 # paste the output into SECRET_ENCRYPTION_KEY in .env
+# also paste an OpenRouter API key (https://openrouter.ai/keys) into OPENROUTER_API_KEY in .env
 
-# 2. Everything, including a one-shot model pull into the ollama container
-docker compose up --build     # postgres, redis, ollama (+ollama-pull), migrate+seed, api, worker
+# 2. Everything
+docker compose up --build     # postgres, redis, migrate+seed, api, worker
 ```
 
-API is on `localhost:8000`. First run will sit at `ollama-pull` for a while —
-it's downloading `qwen3:4b` + `qwen3:8b` + `nomic-embed-text` into the
-`ollama_data` volume; subsequent `up`s skip straight past it.
+API is on `localhost:8000`.
 
 To re-run migrations/seed after a schema change: `docker compose run --rm migrate`.
-To re-pull/update models: `docker compose run --rm ollama-pull`.
-
-### CPU-only Ollama
-
-The `ollama` service runs on CPU (no GPU reservation configured) — expect
-`qwen3:8b` extraction/scoring calls to take noticeably longer than on a GPU
-box, especially under concurrent worker jobs. If it's too slow in practice,
-drop `OLLAMA_EXTRACTION_MODEL` down to `qwen3:4b` for both steps, or swap in
-a smaller model — nothing else in the pipeline assumes a specific model size.
-If you later get access to an NVIDIA GPU + nvidia-container-toolkit, add a
-`deploy.resources.reservations.devices` block to the `ollama` service and
-drop `qwen3:8b` back in.
 
 ## Setup (without Docker for api/worker — faster local iteration)
 
 ```bash
-docker compose up -d postgres redis ollama
-docker compose run --rm ollama-pull           # first time only
+docker compose up -d postgres redis
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 playwright install chromium
-cp .env.example .env   # DATABASE_URL/REDIS_URL/OLLAMA_HOST default to localhost, already correct here
+cp .env.example .env   # DATABASE_URL/REDIS_URL default to localhost, already correct here
+# paste an OpenRouter API key (https://openrouter.ai/keys) into OPENROUTER_API_KEY in .env
 alembic upgrade head
 python -m app.sources_seed
 uvicorn app.api.main:app --reload            # API
 arq app.worker.settings.WorkerSettings        # worker (separate terminal)
 ```
-
-`ollama`'s port 11434 is published to the host, so the natively-run api/worker
-reach it at `http://localhost:11434` — same container, no separate native install.
 
 ## API
 
@@ -148,7 +130,7 @@ updates description/resolution_date/callback/status.
 pytest
 ```
 
-Only covers pure logic (dedup, adaptive scheduling) — no live DB/Ollama/
+Only covers pure logic (dedup, adaptive scheduling) — no live DB/OpenRouter/
 network calls, so it runs without any of the infra above.
 
 ## Known MVP scope cuts (intentional, not oversights)

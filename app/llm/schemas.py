@@ -1,4 +1,5 @@
-"""JSON schemas passed as Ollama's `format` param for constrained/structured decoding."""
+"""JSON schemas passed as OpenRouter's `response_format.json_schema.schema` param
+for strict structured-output decoding."""
 
 QUERY_GEN_SCHEMA = {
     "type": "object",
@@ -11,6 +12,7 @@ QUERY_GEN_SCHEMA = {
         }
     },
     "required": ["queries"],
+    "additionalProperties": False,
 }
 
 EXTRACTION_SCHEMA = {
@@ -33,6 +35,7 @@ EXTRACTION_SCHEMA = {
                 "type": "object",
                 "properties": {"quote": {"type": "string"}},
                 "required": ["quote"],
+                "additionalProperties": False,
             },
         },
     },
@@ -47,4 +50,5 @@ EXTRACTION_SCHEMA = {
         "impact_hint",
         "proofs",
     ],
+    "additionalProperties": False,
 }

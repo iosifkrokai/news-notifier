@@ -39,36 +39,6 @@ services:
         condition: service_healthy
     restart: "no"
 
-  ollama:
-    image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
-    # CPU-only (no GPU reservation block below) — fine for this MVP, just
-    # expect qwen3:8b generations to be slower than on a GPU box. Add a
-    # `deploy.resources.reservations.devices` NVIDIA block later if you get one.
-
-  # One-shot: pulls the models this project needs into the ollama_data volume,
-  # then exits. Re-run anytime with `docker compose run --rm ollama-pull`
-  # (e.g. after wiping the volume, or to grab a model added later).
-  ollama-pull:
-    image: ollama/ollama:latest
-    entrypoint: ["sh", "-c"]
-    command: ["ollama pull qwen3:4b && ollama pull qwen3:8b && ollama pull nomic-embed-text"]
-    environment:
-      OLLAMA_HOST: ollama:11434
-    depends_on:
-      ollama:
-        condition: service_healthy
-    restart: "no"
-
   api:
     build: .
     command: ["api"]
@@ -77,7 +47,6 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/murderer
       REDIS_URL: redis://redis:6379/0
-      OLLAMA_HOST: http://ollama:11434
     env_file: .env
     depends_on:
       postgres:
@@ -85,8 +54,6 @@ services:
       redis:
         condition: service_healthy
       migrate:
-        condition: service_completed_successfully
-      ollama-pull:
         condition: service_completed_successfully
 
   worker:
@@ -95,7 +62,6 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/murderer
       REDIS_URL: redis://redis:6379/0
-      OLLAMA_HOST: http://ollama:11434
     env_file: .env
     depends_on:
       postgres:
@@ -104,9 +70,6 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
-      ollama-pull:
-        condition: service_completed_successfully
 
 volumes:
   pgdata:
-  ollama_data:

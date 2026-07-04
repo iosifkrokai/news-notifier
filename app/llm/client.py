@@ -5,10 +5,10 @@ import httpx
 from app.config import get_settings
 
 
-class OllamaClient:
-    """Thin async wrapper over the local Ollama HTTP API."""
+class OpenRouterClient:
+    """Thin async wrapper over OpenRouter's OpenAI-compatible HTTP API."""
 
-    async def generate_json(self, model: str, system: str, prompt: str, schema: dict) -> dict:
+    async def generate_json(self, model: str, system: str, prompt: str, schema: dict, name: str) -> dict:
         settings = get_settings()
         payload = {
             "model": model,
@@ -16,21 +16,25 @@ class OllamaClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
-            "format": schema,
-            "stream": False,
-            "options": {"temperature": 0.1},
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": name, "strict": True, "schema": schema},
+            },
+            "temperature": 0.1,
         }
-        async with httpx.AsyncClient(base_url=settings.ollama_host, timeout=120) as client:
-            resp = await client.post("/api/chat", json=payload)
+        headers = {"Authorization": f"Bearer {settings.openrouter_api_key}"}
+        async with httpx.AsyncClient(base_url=settings.openrouter_base_url, timeout=120) as client:
+            resp = await client.post("/chat/completions", json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
-        return json.loads(data["message"]["content"])
+        return json.loads(data["choices"][0]["message"]["content"])
 
-    async def embed(self, model: str, text: str) -> list[float]:
+    async def embed(self, model: str, text: str, dimensions: int) -> list[float]:
         settings = get_settings()
-        payload = {"model": model, "input": text}
-        async with httpx.AsyncClient(base_url=settings.ollama_host, timeout=60) as client:
-            resp = await client.post("/api/embed", json=payload)
+        payload = {"model": model, "input": text, "dimensions": dimensions}
+        headers = {"Authorization": f"Bearer {settings.openrouter_api_key}"}
+        async with httpx.AsyncClient(base_url=settings.openrouter_base_url, timeout=60) as client:
+            resp = await client.post("/embeddings", json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
-        return data["embeddings"][0]
+        return data["data"][0]["embedding"]

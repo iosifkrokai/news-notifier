@@ -1,5 +1,5 @@
 from app.config import get_settings
-from app.llm.client import OllamaClient
+from app.llm.client import OpenRouterClient
 from app.llm.schemas import QUERY_GEN_SCHEMA
 
 SYSTEM_PROMPT = (
@@ -12,12 +12,13 @@ SYSTEM_PROMPT = (
 
 async def generate_queries(market_description: str) -> list[str]:
     settings = get_settings()
-    client = OllamaClient()
+    client = OpenRouterClient()
     result = await client.generate_json(
         model=settings.llm_query_gen_model,
         system=SYSTEM_PROMPT,
         prompt=f"Prediction market resolution question:\n{market_description}\n\nGenerate search queries.",
         schema=QUERY_GEN_SCHEMA,
+        name="query_gen",
     )
     queries = result.get("queries") or []
     return [q for q in queries if q.strip()][:5]
