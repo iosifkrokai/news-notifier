@@ -17,6 +17,7 @@ from app.scoring.credibility import compute_credibility
 from app.scraping.playwright_scraper import scrape_urls
 from app.search.aggregator import parse_published_at, search_all_sources, url_hash
 from app.security import decrypt_secret
+from app.worker.errors import serializable_job_errors
 
 
 def _domain_of(url: str) -> str:
@@ -55,6 +56,7 @@ def _next_poll_at(resolution_date: datetime | None, now: datetime, default_minut
     return now + timedelta(minutes=default_minutes)
 
 
+@serializable_job_errors
 async def process_market(ctx: dict, market_id: str) -> None:
     """Dispatcher: generate queries -> search -> filter fresh candidates -> fan out
     one process_candidate job per URL. Deliberately does NO scraping or LLM
@@ -101,6 +103,7 @@ async def process_market(ctx: dict, market_id: str) -> None:
         )
 
 
+@serializable_job_errors
 async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
     """Heavy per-URL job: scrape -> extract/score -> embed -> dedup -> store one
     NewsItem, then enqueue its own single-item deliver_batch. Runs independently
@@ -208,6 +211,7 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
     await redis.enqueue_job("deliver_batch", log_id)
 
 
+@serializable_job_errors
 async def deliver_batch(ctx: dict, delivery_log_id: str) -> None:
     """Send (or resend) the webhook for one already-stored batch. Independent
     retry target: arq re-runs *only this* job on failure — no re-search, no

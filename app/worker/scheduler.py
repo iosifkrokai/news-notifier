@@ -4,12 +4,14 @@ from sqlalchemy import select
 
 from app.db.models import DeliveryLog, DeliveryStatus, Market, MarketStatus
 from app.db.session import async_session_factory
+from app.worker.errors import serializable_job_errors
 
 # How long a delivery is allowed to sit at `pending` (committed but never
 # enqueued, e.g. a worker crash between the two) before the sweep re-enqueues it.
 STUCK_DELIVERY_THRESHOLD = timedelta(minutes=5)
 
 
+@serializable_job_errors
 async def enqueue_due_markets(ctx: dict) -> None:
     """Cron job: find every active market whose next_poll_at has passed and
     enqueue one process_market job each. Runs frequently (see WorkerSettings);
@@ -29,6 +31,7 @@ async def enqueue_due_markets(ctx: dict) -> None:
         await redis.enqueue_job("process_market", str(market_id), _job_id=f"process_market:{market_id}")
 
 
+@serializable_job_errors
 async def enqueue_stuck_deliveries(ctx: dict) -> None:
     """Cron job: DeliveryLog rows are committed before the deliver_batch job is
     enqueued (see app.worker.tasks.process_market) — a crash or Redis hiccup in
