@@ -27,3 +27,12 @@ class WorkerSettings:
     # process_candidate is one scrape + one LLM extraction + one embed. The old
     # 600s existed because the whole per-market batch ran in one job.
     job_timeout = 180
+    # process_candidate is the only job that calls the LLM (extract_and_score),
+    # one call per job. Keep this close to the `llm` service's --parallel
+    # (docker-compose.yml, currently 3): running more process_candidate jobs
+    # concurrently than the LLM server has slots for doesn't add throughput,
+    # it just queues extra requests on llama.cpp's side while still holding a
+    # Playwright browser + FastEmbed call open on ours. +1 over --parallel
+    # gives embed_text/scrape_urls-only work (nothing waiting on the LLM slot)
+    # a bit of headroom to proceed independently.
+    max_jobs = 4

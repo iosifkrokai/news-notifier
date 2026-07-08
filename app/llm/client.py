@@ -8,14 +8,16 @@ from app.config import get_settings
 
 # arq only retries a job if it explicitly raises arq.worker.Retry — any other
 # exception (e.g. a plain HTTPStatusError) just fails the job outright, so
-# transient/rate-limit errors from OpenRouter must be retried here, not left
-# to the queue.
+# transient/rate-limit errors must be retried here, not left to the queue.
 _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 _MAX_RETRIES = 3
 
 
-class OpenRouterClient:
-    """Thin async wrapper over OpenRouter's OpenAI-compatible HTTP API."""
+class LLMClient:
+    """Thin async wrapper over any OpenAI-compatible /chat/completions API —
+    defaults to a local llama.cpp server (see Settings.llm_base_url), but
+    works unmodified against OpenRouter or any other OpenAI-compatible
+    provider too, since it's just an HTTP client with a configurable base_url."""
 
     async def generate_json(self, model: str, system: str, prompt: str, schema: dict, name: str) -> dict:
         settings = get_settings()
@@ -31,10 +33,14 @@ class OpenRouterClient:
             },
             "temperature": 0.1,
         }
-        headers = {"Authorization": f"Bearer {settings.openrouter_api_key}"}
-        async with httpx.AsyncClient(base_url=settings.openrouter_base_url, timeout=120) as client:
+        headers = {}
+        if settings.llm_api_key:
+            headers["Authorization"] = f"Bearer {settings.llm_api_key}"
+        async with httpx.AsyncClient(base_url=settings.llm_base_url, timeout=120) as client:
             resp = await self._post_with_retry(client, "/chat/completions", payload, headers)
-        return json.loads(resp.json()["choices"][0]["message"]["content"])
+        data = json.loads(resp.json()["choices"][0]["message"]["content"])
+        _ensure_required_keys(data, schema, name)
+        return data
 
     async def _post_with_retry(
         self, client: httpx.AsyncClient, path: str, payload: dict, headers: dict
@@ -45,6 +51,23 @@ class OpenRouterClient:
                 resp.raise_for_status()
                 return resp
             await asyncio.sleep(_retry_delay(resp, attempt))
+
+
+def _ensure_required_keys(data: dict, schema: dict, name: str) -> None:
+    """llama.cpp's grammar-constrained decoding has a documented failure mode:
+    if a schema feature its GBNF converter can't handle slips through, it can
+    silently fall back to *unconstrained* generation instead of erroring — the
+    request still returns 200 with something that may or may not be the JSON
+    we asked for. `json.loads` above already catches "not JSON at all"; this
+    catches "valid JSON, wrong shape" (e.g. a chatty response wrapped in a
+    plausible-looking object) before it causes a confusing KeyError several
+    calls away from the actual cause."""
+    missing = [key for key in schema.get("required", []) if key not in data]
+    if missing:
+        raise ValueError(
+            f"LLM response for '{name}' is missing required field(s) {missing} — "
+            "the model likely didn't honor the JSON schema (see _ensure_required_keys)."
+        )
 
 
 def _retry_delay(resp: httpx.Response, attempt: int) -> float:

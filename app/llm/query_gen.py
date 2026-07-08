@@ -1,5 +1,5 @@
 from app.config import get_settings
-from app.llm.client import OpenRouterClient
+from app.llm.client import LLMClient
 from app.llm.schemas import QUERY_GEN_SCHEMA
 
 SYSTEM_PROMPT = (
@@ -12,7 +12,7 @@ SYSTEM_PROMPT = (
 
 async def generate_queries(market_description: str) -> list[str]:
     settings = get_settings()
-    client = OpenRouterClient()
+    client = LLMClient()
     result = await client.generate_json(
         model=settings.llm_query_gen_model,
         system=SYSTEM_PROMPT,

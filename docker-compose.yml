@@ -48,6 +48,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/news_notifier
       REDIS_URL: redis://redis:6379/0
+      LLM_BASE_URL: http://llm:8080/v1
     env_file: .env
     depends_on:
       postgres:
@@ -58,6 +59,11 @@ services:
       # so the schema exists by the time jobs run.
       api:
         condition: service_started
+      # worker is the only service that calls the LLM (see app/worker/tasks.py) —
+      # wait for a real 200 from /health, not just "container started", since the
+      # first boot is downloading a ~2.5GB model (see the llm service above).
+      llm:
+        condition: service_healthy
 
   # arq job monitoring UI — reads worker/scheduler queue state straight out of
   # Redis, no changes to the worker itself. https://github.com/antonko/arq-ui
@@ -72,5 +78,45 @@ services:
       redis:
         condition: service_healthy
 
+  # Local CPU inference for query-gen + extraction/scoring (see app/llm/client.py)
+  # — replaces OpenRouter by default. -hf downloads the quant from Hugging Face
+  # on first boot (~2.5GB) into the llm_models volume, so restarts don't
+  # re-download. --parallel is the number of concurrent requests the server
+  # will actually run; WorkerSettings.max_jobs (app/worker/settings.py) is
+  # deliberately kept close to this number — queuing past it just adds latency,
+  # it doesn't add throughput. --ctx-size is the *total* KV budget across all
+  # parallel slots, not per-request (12288 / 3 = 4096 tokens/slot — enough for
+  # the system prompt + the 8000-char truncated article text + schema + reply).
+  llm:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command:
+      - -hf
+      - bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF:Q4_K_M
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8080"
+      - --parallel
+      - "3"
+      - --ctx-size
+      - "12288"
+      - --jinja
+    environment:
+      HF_HOME: /models
+    volumes:
+      - llm_models:/models
+    ports:
+      - "8080:8080"
+    healthcheck:
+      # Generous start_period: first boot downloads the model before the
+      # server can report ready; later boots just need to mmap it from the
+      # cached volume, which is much faster.
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 300s
+
 volumes:
   pgdata:
+  llm_models:

@@ -12,11 +12,17 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/news_notifier"
     redis_url: str = "redis://localhost:6379/0"
 
-    # LLM (OpenRouter — https://openrouter.ai)
-    openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_api_key: str = ""
-    llm_query_gen_model: str = "openai/gpt-4o-mini"
-    llm_extraction_model: str = "openai/gpt-4o-mini"
+    # LLM — defaults to a local llama.cpp server (see the `llm` service in
+    # docker-compose.yml), no API key needed. llm_base_url/llm_api_key point at
+    # any OpenAI-compatible /chat/completions endpoint though, so switching to
+    # a cloud provider (OpenRouter, etc.) is just an .env change — see the
+    # commented example in .env.example. Model names are ignored by llama.cpp
+    # in single-model mode; they only matter again if you point this at a
+    # multi-model/router backend or a cloud provider.
+    llm_base_url: str = "http://localhost:8080/v1"
+    llm_api_key: str = ""
+    llm_query_gen_model: str = "local"
+    llm_extraction_model: str = "local"
 
     # Embeddings — computed locally via FastEmbed (ONNX), no external API call.
     # Changing the model changes embedding_dim, which requires a new migration
