@@ -243,6 +243,20 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
         # --- critical section: dedup-check-and-insert, serialized per market ---
         await session.execute(select(func.pg_advisory_xact_lock(_market_lock_key(market.id))))
 
+        # Re-check status under the lock: `market` was read before a scrape +
+        # multi-minute extraction, during which the market may have been paused
+        # (unsubscribe). Re-read committed state so a candidate already in flight
+        # when unsubscribe fired — which arq's abort can't stop once it's past
+        # the entry guard — doesn't still store a NewsItem / trigger a delivery.
+        current_status = (
+            await session.execute(select(Market.status).where(Market.id == market.id))
+        ).scalar_one_or_none()
+        if current_status != MarketStatus.active:
+            logger.info(
+                "process_candidate drop reason=market_inactive url=%s", scrape_result["final_url"]
+            )
+            return
+
         stored = (
             await session.execute(
                 select(NewsItem.canonical_url_hash, NewsItem.title_simhash).where(
