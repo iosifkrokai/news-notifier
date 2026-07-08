@@ -23,6 +23,16 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_query_gen_model: str = "local"
     llm_extraction_model: str = "local"
+    # Per-request HTTP timeout for LLM calls. Local llama.cpp on CPU is slow
+    # (single-digit tokens/sec), so an extraction over a long article can take
+    # minutes — a tight timeout here makes every call raise ReadTimeout, which
+    # extract_and_score swallows, silently dropping every candidate. Keep this
+    # comfortably above a worst-case extraction; worker job_timeout must exceed it.
+    llm_request_timeout_seconds: int = 600
+    # Upper bound on article characters fed to the extraction prompt. Prompt-eval
+    # is the dominant CPU cost for llama.cpp, so this directly bounds latency.
+    # The lead of a news article carries almost all the resolution-relevant signal.
+    extraction_max_chars: int = 4000
 
     # Embeddings — computed locally via FastEmbed (ONNX), no external API call.
     # Changing the model changes embedding_dim, which requires a new migration
@@ -73,6 +83,23 @@ class Settings(BaseSettings):
 
     # Search
     search_results_per_source: int = 8
+    # Semantic candidate pre-filter (see app.llm.prefilter). Search fans every
+    # query out to every source, so a market's first cycle can surface dozens of
+    # fresh URLs — most only loosely related. Before paying for a scrape + a slow
+    # local-LLM extraction per URL, we cheaply rank candidates by the cosine
+    # similarity of their title to the market description (same FastEmbed model
+    # used for dedup, milliseconds per title) and only process the strongest.
+    # top_k caps how many survive; min_similarity drops obvious junk outright.
+    # Set top_k to 0 to disable the pre-filter (process every fresh candidate).
+    candidate_prefilter_top_k: int = 15
+    candidate_prefilter_min_similarity: float = 0.30
+    # Recency floor applied before the semantic pre-filter: drop candidates
+    # published longer ago than this. Cheap way to skip stale coverage a broad
+    # search inevitably drags in. Candidates whose published_at is missing or
+    # unparseable are KEPT (sources report dates in inconsistent formats — losing
+    # a good article to a bad date string is worse than processing one extra).
+    # Set to 0 to disable the recency filter.
+    candidate_max_age_days: int = 30
 
 
 @lru_cache

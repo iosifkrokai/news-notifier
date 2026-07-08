@@ -36,7 +36,9 @@ class LLMClient:
         headers = {}
         if settings.llm_api_key:
             headers["Authorization"] = f"Bearer {settings.llm_api_key}"
-        async with httpx.AsyncClient(base_url=settings.llm_base_url, timeout=120) as client:
+        async with httpx.AsyncClient(
+            base_url=settings.llm_base_url, timeout=settings.llm_request_timeout_seconds
+        ) as client:
             resp = await self._post_with_retry(client, "/chat/completions", payload, headers)
         data = json.loads(resp.json()["choices"][0]["message"]["content"])
         _ensure_required_keys(data, schema, name)

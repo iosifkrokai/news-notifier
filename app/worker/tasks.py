@@ -1,3 +1,4 @@
+import logging
 import random
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,7 @@ from app.dedup.vector_dedup import find_similar
 from app.delivery.webhook import send_webhook
 from app.llm.embeddings import embed_text
 from app.llm.extraction import extract_and_score
+from app.llm.prefilter import select_relevant_candidates
 from app.llm.query_gen import generate_queries
 from app.scoring.credibility import compute_credibility
 from app.scraping.playwright_scraper import scrape_urls
@@ -21,9 +23,26 @@ from app.security import decrypt_secret
 from app.worker.errors import serializable_job_errors
 from app.worker.job_ids import process_market_job_id
 
+logger = logging.getLogger(__name__)
+
 
 def _domain_of(url: str) -> str:
     return urlsplit(url).netloc.removeprefix("www.")
+
+
+def _filter_by_recency(candidates: list[dict], max_age_days: int, now: datetime) -> list[dict]:
+    """Drop candidates published longer ago than max_age_days. Candidates with a
+    missing/unparseable published_at are kept — see Settings.candidate_max_age_days.
+    max_age_days <= 0 disables the filter."""
+    if max_age_days <= 0:
+        return candidates
+    cutoff = now - timedelta(days=max_age_days)
+    kept = []
+    for candidate in candidates:
+        published_at = parse_published_at(candidate.get("published_at"))
+        if published_at is None or published_at >= cutoff:
+            kept.append(candidate)
+    return kept
 
 
 def _market_lock_key(market_id: uuid.UUID) -> int:
@@ -108,6 +127,28 @@ async def process_market(ctx: dict, market_id: str) -> None:
         )
         fresh_candidates = [c for c in candidates if c["canonical_url_hash"] not in existing_hashes]
 
+        # Cheap pre-filters before the expensive per-candidate pipeline: drop
+        # stale coverage, then keep only the top-K semantically closest to the
+        # market. Both run on already-fetched search metadata (title + date), so
+        # they cost ~nothing compared to a scrape + local-LLM extraction per URL.
+        recent_candidates = _filter_by_recency(
+            fresh_candidates, settings.candidate_max_age_days, datetime.now(timezone.utc)
+        )
+        selected_candidates = await select_relevant_candidates(
+            market.description,
+            recent_candidates,
+            settings.candidate_prefilter_top_k,
+            settings.candidate_prefilter_min_similarity,
+        )
+        logger.info(
+            "process_market market=%s candidates: found=%d fresh=%d recent=%d selected=%d",
+            market_id,
+            len(candidates),
+            len(fresh_candidates),
+            len(recent_candidates),
+            len(selected_candidates),
+        )
+
         market.last_polled_at = datetime.now(timezone.utc)
         market.next_poll_at = _next_poll_at(
             market.resolution_date,
@@ -130,7 +171,7 @@ async def process_market(ctx: dict, market_id: str) -> None:
         _defer_until=next_poll_at,
     )
 
-    for candidate in fresh_candidates:
+    for candidate in selected_candidates:
         # _job_id dedups a re-enqueue of the same URL across overlapping cycles
         # (same idea as scheduler.enqueue_due_markets), so a candidate that's slow
         # to process isn't picked up twice by the next poll tick.
@@ -164,6 +205,7 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
         )
         scrape_result = scraped.get(candidate["url"])
         if not scrape_result or not scrape_result["success"]:
+            logger.info("process_candidate drop reason=scrape_failed url=%s", candidate["url"])
             return
 
         # Hash/domain must come from the post-redirect final_url, not the
@@ -176,8 +218,14 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
             extracted = await extract_and_score(market.description, scrape_result["text"], domain)
         except Exception:
             # A flaky/malformed LLM call fails just this candidate, not a batch.
+            # This is the path that silently swallowed *every* candidate when the
+            # local LLM was timing out — log it so that failure mode is visible.
+            logger.warning(
+                "process_candidate drop reason=extraction_error url=%s", candidate["url"], exc_info=True
+            )
             return
         if not extracted or not extracted.get("is_relevant"):
+            logger.info("process_candidate drop reason=not_relevant url=%s", candidate["url"])
             return
 
         title = extracted["title"]
@@ -186,6 +234,9 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
         try:
             embedding = await embed_text(extracted["summary"])
         except Exception:
+            logger.warning(
+                "process_candidate drop reason=embed_error url=%s", candidate["url"], exc_info=True
+            )
             return
 
         # --- critical section: dedup-check-and-insert, serialized per market ---
@@ -199,17 +250,23 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
             )
         ).all()
         if any(h == final_hash for h, _ in stored):
-            return  # exact URL already stored (also guarded by uq_news_market_url)
+            # exact URL already stored (also guarded by uq_news_market_url)
+            logger.info("process_candidate drop reason=dup_url url=%s", scrape_result["final_url"])
+            return
         if any(
             s is not None
             and hamming_distance(title_hash, from_signed_64(s)) <= settings.simhash_hamming_threshold
             for _, s in stored
         ):
-            return  # near-duplicate title already stored for this market
+            # near-duplicate title already stored for this market
+            logger.info("process_candidate drop reason=dup_title url=%s", scrape_result["final_url"])
+            return
 
         similar = await find_similar(session, market.id, embedding, settings.vector_dedup_threshold)
         if similar is not None:
-            return  # semantic duplicate of a news item already stored for this market
+            # semantic duplicate of a news item already stored for this market
+            logger.info("process_candidate drop reason=dup_semantic url=%s", scrape_result["final_url"])
+            return
 
         credibility = await compute_credibility(session, domain, extracted["credibility_signal"])
         relevance = max(0.0, min(1.0, extracted["relevance_score"]))
@@ -245,7 +302,11 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
         session.add(delivery_log)
         await session.commit()  # releases the advisory xact lock
         log_id = str(delivery_log.id)
+        item_id = str(item.id)
 
+    logger.info(
+        "process_candidate stored news_item=%s delivery_log=%s url=%s", item_id, log_id, scrape_result["final_url"]
+    )
     redis = ctx["redis"]
     await redis.enqueue_job("deliver_batch", log_id)
 

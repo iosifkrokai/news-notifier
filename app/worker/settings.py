@@ -1,3 +1,5 @@
+import logging
+
 from arq import cron
 from arq.connections import RedisSettings
 
@@ -8,10 +10,26 @@ from app.worker.tasks import deliver_batch, process_candidate, process_market
 _settings = get_settings()
 
 
+async def _configure_logging(ctx: dict) -> None:
+    """arq only sets up its own `arq` logger, so our `app.*` INFO lines (the
+    per-candidate funnel/drop reasons in app.worker.tasks) would otherwise be
+    dropped by the root last-resort handler at WARNING. Give the `app` namespace
+    its own stdout handler at INFO. propagate=False keeps this independent of
+    arq's handler so lines aren't duplicated."""
+    app_logger = logging.getLogger("app")
+    if not app_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        app_logger.addHandler(handler)
+        app_logger.setLevel(logging.INFO)
+        app_logger.propagate = False
+
+
 class WorkerSettings:
     """arq worker entrypoint: `arq app.worker.settings.WorkerSettings`"""
 
     redis_settings = RedisSettings.from_dsn(_settings.redis_url)
+    on_startup = _configure_logging
     functions = [process_market, process_candidate, deliver_batch]
     # enqueue_due_markets is now just a safety net (process_market self-schedules
     # its own next run — see app.worker.tasks.process_market), so it only needs
@@ -23,16 +41,17 @@ class WorkerSettings:
         cron(enqueue_stuck_deliveries, minute=set(range(60))),
     ]
     max_tries = 6
-    # No single job is heavy anymore: process_market only dispatches, and each
-    # process_candidate is one scrape + one LLM extraction + one embed. The old
-    # 600s existed because the whole per-market batch ran in one job.
-    job_timeout = 180
+    # process_candidate does one scrape + one (slow, local-CPU) LLM extraction +
+    # one embed. This must exceed Settings.llm_request_timeout_seconds (600) so
+    # the arq job doesn't get killed *before* the LLM client's own timeout has a
+    # chance to fire and be retried — plus headroom for scrape + embed.
+    job_timeout = _settings.llm_request_timeout_seconds + 120
     # process_candidate is the only job that calls the LLM (extract_and_score),
-    # one call per job. Keep this close to the `llm` service's --parallel
-    # (docker-compose.yml, currently 3): running more process_candidate jobs
-    # concurrently than the LLM server has slots for doesn't add throughput,
-    # it just queues extra requests on llama.cpp's side while still holding a
-    # Playwright browser + FastEmbed call open on ours. +1 over --parallel
-    # gives embed_text/scrape_urls-only work (nothing waiting on the LLM slot)
-    # a bit of headroom to proceed independently.
-    max_jobs = 4
+    # one call per job. On CPU, llama.cpp's *total* token throughput is fixed, so
+    # running more extractions concurrently than it has slots doesn't add
+    # throughput — it just splits that fixed budget, making each request slower
+    # and far more likely to hit its timeout. We deliberately keep concurrency at
+    # or below the `llm` service's --parallel (docker-compose.yml, currently 3)
+    # so each extraction finishes as fast as the hardware allows. The semantic
+    # pre-filter (see process_market) is what actually cuts total LLM volume.
+    max_jobs = 3
