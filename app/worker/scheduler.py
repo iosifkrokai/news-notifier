@@ -57,10 +57,17 @@ async def enqueue_stuck_deliveries(ctx: dict) -> None:
     Sweep for any that have sat too long and re-enqueue them."""
     cutoff = datetime.now(timezone.utc) - STUCK_DELIVERY_THRESHOLD
     async with async_session_factory() as session:
+        # Join Market and require it still active: a pending delivery for a
+        # paused/resolved (unsubscribed) market is deliberately abandoned by
+        # deliver_batch, so re-enqueuing it here would loop forever.
         log_ids = (
             await session.execute(
-                select(DeliveryLog.id).where(
-                    DeliveryLog.status == DeliveryStatus.pending, DeliveryLog.created_at <= cutoff
+                select(DeliveryLog.id)
+                .join(Market, Market.id == DeliveryLog.market_id)
+                .where(
+                    DeliveryLog.status == DeliveryStatus.pending,
+                    DeliveryLog.created_at <= cutoff,
+                    Market.status == MarketStatus.active,
                 )
             )
         ).scalars().all()

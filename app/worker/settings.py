@@ -31,6 +31,10 @@ class WorkerSettings:
     redis_settings = RedisSettings.from_dsn(_settings.redis_url)
     on_startup = _configure_logging
     functions = [process_market, process_candidate, deliver_batch]
+    # Lets unsubscribe actively cancel a market's in-flight/queued jobs instead
+    # of waiting for each to dequeue and no-op on the paused-status guard — see
+    # app.worker.abort.abort_market_jobs and the DELETE /markets route.
+    allow_abort_jobs = True
     # enqueue_due_markets is now just a safety net (process_market self-schedules
     # its own next run — see app.worker.tasks.process_market), so it only needs
     # to run often enough to catch a lost job within OVERDUE_THRESHOLD, not every

@@ -20,6 +20,7 @@ from app.scoring.credibility import compute_credibility
 from app.scraping.playwright_scraper import scrape_urls
 from app.search.aggregator import parse_published_at, search_all_sources, url_hash
 from app.security import decrypt_secret
+from app.worker.abort import register_market_job
 from app.worker.errors import serializable_job_errors
 from app.worker.job_ids import process_market_job_id
 
@@ -175,12 +176,12 @@ async def process_market(ctx: dict, market_id: str) -> None:
         # _job_id dedups a re-enqueue of the same URL across overlapping cycles
         # (same idea as scheduler.enqueue_due_markets), so a candidate that's slow
         # to process isn't picked up twice by the next poll tick.
-        await redis.enqueue_job(
-            "process_candidate",
-            market_id,
-            candidate,
-            _job_id=f"process_candidate:{market_id}:{candidate['canonical_url_hash']}",
-        )
+        candidate_job_id = f"process_candidate:{market_id}:{candidate['canonical_url_hash']}"
+        await redis.enqueue_job("process_candidate", market_id, candidate, _job_id=candidate_job_id)
+        # Track it so unsubscribe can abort this market's in-flight/queued
+        # candidates instead of letting each one dequeue and no-op — see
+        # app.worker.abort and the DELETE /markets route.
+        await register_market_job(redis, market_id, candidate_job_id)
 
 
 @serializable_job_errors
@@ -325,6 +326,13 @@ async def deliver_batch(ctx: dict, delivery_log_id: str) -> None:
 
         market = await session.get(Market, log.market_id)
         if market is None:
+            return
+        if market.status != MarketStatus.active:
+            # Market was paused/resolved (unsubscribe) after this batch was
+            # queued — don't emit a webhook for a market nobody's watching. Left
+            # at `pending`; enqueue_stuck_deliveries filters to active markets, so
+            # this is simply abandoned rather than re-enqueued in a loop.
+            logger.info("deliver_batch skip reason=market_inactive delivery_log=%s", delivery_log_id)
             return
 
         items = [
