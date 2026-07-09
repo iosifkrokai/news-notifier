@@ -1,7 +1,10 @@
 import asyncio
 
+import httpx
 import trafilatura
 from playwright.async_api import async_playwright
+
+from app.scraping.extractors import find_extractor
 
 # A real Chrome UA, not a self-identifying bot string. Many news sites gate or
 # degrade content for obvious bots (the old NewsNotifierBot/1.0 UA measurably cut
@@ -30,30 +33,56 @@ async def scrape_urls(urls: list[str], timeout_ms: int, concurrency: int) -> dic
         return results
 
     semaphore = asyncio.Semaphore(concurrency)
+    # Shared client for the domain-specific extractors (see app.scraping.extractors)
+    # — they hit a site's content API directly instead of driving the browser.
+    http = httpx.AsyncClient(timeout=timeout_ms / 1000, headers={"User-Agent": USER_AGENT})
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
 
+        async def _scrape_via_browser(url: str) -> None:
+            context = None
+            try:
+                context = await browser.new_context(user_agent=USER_AGENT)
+                page = await context.new_page()
+                await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+                # Wait for the article container so client-rendered pages have their
+                # body in the DOM before we snapshot it. networkidle is unreliable
+                # here — tracker-heavy SPAs never go idle — so key off the content,
+                # not the network, and fall through on timeout (some valid pages
+                # use none of these tags; trafilatura still extracts from the HTML).
+                try:
+                    await page.wait_for_selector("article, main, [role=main]", timeout=timeout_ms)
+                except Exception:  # noqa: BLE001 — best-effort; extract whatever loaded
+                    pass
+                final_url = page.url
+                html = await page.content()
+                extracted = trafilatura.extract(html, include_comments=False, favor_recall=True)
+                results[url] = {
+                    "final_url": final_url,
+                    "text": extracted or "",
+                    "success": bool(extracted),
+                }
+            except Exception as exc:  # noqa: BLE001 — any single-page failure must not abort the batch
+                results[url] = {"final_url": url, "text": "", "success": False, "error": str(exc)}
+            finally:
+                if context is not None:
+                    await context.close()
+
         async def _scrape_one(url: str) -> None:
             async with semaphore:
-                context = None
-                try:
-                    context = await browser.new_context(user_agent=USER_AGENT)
-                    page = await context.new_page()
-                    await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
-                    final_url = page.url
-                    html = await page.content()
-                    extracted = trafilatura.extract(html, include_comments=False, favor_recall=True)
-                    results[url] = {
-                        "final_url": final_url,
-                        "text": extracted or "",
-                        "success": bool(extracted),
-                    }
-                except Exception as exc:  # noqa: BLE001 — any single-page failure must not abort the batch
-                    results[url] = {"final_url": url, "text": "", "success": False, "error": str(exc)}
-                finally:
-                    if context is not None:
-                        await context.close()
+                # Try a domain-specific fast path first (e.g. MSN's content API);
+                # only drive the browser if there's no extractor or it declined.
+                extractor = find_extractor(url)
+                if extractor is not None:
+                    try:
+                        result = await extractor.extract(url, http)
+                    except Exception:  # noqa: BLE001 — a broken extractor must fall through, not fail the URL
+                        result = None
+                    if result is not None:
+                        results[url] = result
+                        return
+                await _scrape_via_browser(url)
 
         try:
             # return_exceptions=True so one task's unhandled exception can't cancel
@@ -61,5 +90,6 @@ async def scrape_urls(urls: list[str], timeout_ms: int, concurrency: int) -> dic
             await asyncio.gather(*(_scrape_one(u) for u in urls), return_exceptions=True)
         finally:
             await browser.close()
+            await http.aclose()
 
     return results
