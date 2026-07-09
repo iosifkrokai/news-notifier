@@ -1,5 +1,5 @@
-"""JSON schemas passed as OpenRouter's `response_format.json_schema.schema` param
-for strict structured-output decoding."""
+"""JSON schemas passed as the `response_format.json_schema.schema` param (see
+app.llm.client.LLMClient) for strict structured-output decoding."""
 
 QUERY_GEN_SCHEMA = {
     "type": "object",

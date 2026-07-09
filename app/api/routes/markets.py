@@ -14,6 +14,8 @@ from app.config import get_settings
 from app.db.models import Market, MarketStatus, NewsItem
 from app.db.session import get_session
 from app.security import encrypt_secret
+from app.worker.abort import abort_market_jobs
+from app.worker.job_ids import process_market_job_id
 
 router = APIRouter(prefix="/markets", tags=["markets"])
 
@@ -90,12 +92,19 @@ async def subscribe(
     await session.commit()
     await session.refresh(market)
 
-    # Trigger a first run right away instead of waiting for the scheduler tick,
-    # so a fresh subscription gets a backfill batch on day one, not a day later.
-    # _job_id dedups against the scheduler cron picking up the same market
-    # (next_poll_at=now, above) before this run's commit advances it.
+    # Trigger a first run right away instead of waiting for the scheduler
+    # safety-net tick, so a fresh subscription gets a backfill batch on day one,
+    # not minutes later. process_market_job_id's timestamp component means this
+    # can't collide/dedup with a later safety-net sweep enqueue the way the old
+    # static job_id did — but that's fine: if both somehow fire, process_market
+    # is idempotent per candidate (see the existing_hashes check), so a rare
+    # double run just costs one extra query-gen+search pass, never duplicate
+    # webhooks.
     await request.app.state.redis.enqueue_job(
-        "process_market", str(market.id), _job_id=f"process_market:{market.id}"
+        "process_market",
+        str(market.id),
+        _job_id=process_market_job_id(str(market.id), now),
+        _defer_until=now,
     )
 
     return MarketResponse(
@@ -107,7 +116,9 @@ async def subscribe(
 
 
 @router.delete("/{market_id}", status_code=204)
-async def unsubscribe(market_id: str, session: AsyncSession = Depends(get_session)) -> None:
+async def unsubscribe(
+    market_id: str, request: Request, session: AsyncSession = Depends(get_session)
+) -> None:
     market = (
         await session.execute(select(Market).where(Market.external_market_id == market_id))
     ).scalar_one_or_none()
@@ -115,11 +126,20 @@ async def unsubscribe(market_id: str, session: AsyncSession = Depends(get_sessio
         raise HTTPException(404, "Market not found")
     market.status = MarketStatus.paused
     await session.commit()
+    # Actively cancel this market's in-flight/queued jobs so we stop spending
+    # resources (notably slow LLM extractions) on a market nobody's watching. The
+    # status guard in each job is the correctness backstop; this is the resource
+    # saver on top of it. Runs after commit so a job that re-reads the row sees
+    # `paused`.
+    await abort_market_jobs(request.app.state.redis, str(market.id))
 
 
 @router.patch("/{market_id}", response_model=MarketResponse)
 async def update_market(
-    market_id: str, body: MarketUpdateRequest, session: AsyncSession = Depends(get_session)
+    market_id: str,
+    body: MarketUpdateRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
 ) -> MarketResponse:
     market = (
         await session.execute(select(Market).where(Market.external_market_id == market_id))
@@ -140,6 +160,10 @@ async def update_market(
 
     await session.commit()
     await session.refresh(market)
+    # Pausing/resolving via PATCH stops the market just like unsubscribe, so
+    # cancel its in-flight/queued jobs too (no-op abort set when already active).
+    if body.status is not None and market.status != MarketStatus.active:
+        await abort_market_jobs(request.app.state.redis, str(market.id))
     return MarketResponse(
         market_id=market.external_market_id,
         status=market.status.value,

@@ -1,4 +1,4 @@
-# murderer — reactive news agent for prediction markets
+# news-notifier — reactive news agent for prediction markets
 
 Subscribe a prediction market once (question + resolution criteria + a
 callback URL). The agent then, on its own schedule, searches the web,
@@ -11,13 +11,14 @@ seen for that market, and pushes new, deduplicated news as a signed webhook.
 ```
 POST /markets/subscribe ─▶ Postgres (markets)
                                │
-                     arq cron (every minute, checks next_poll_at)
+                  process_market self-schedules its own
+                  next run via arq _defer_until=next_poll_at
                                │
                       process_market job
                                │
         ┌───────────┬──────────┴──────────┬────────────┐
    query-gen     search (GDELT +      Playwright      extraction+
-   (OpenRouter)  Google News RSS +    scrape          scoring (OpenRouter)
+   (local LLM)   Google News RSS +    scrape          scoring (local LLM)
                  DuckDuckGo best-effort)                    │
                                │                       dedup (URL-hash /
                                └──────────────────────▶ simhash / pgvector)
@@ -37,6 +38,14 @@ pipeline on delivery failure would have the dedup logic silently swallow
 the retry (the news is already in the DB) and the webhook would never
 go out again.
 
+**Scheduling:** each `process_market` run re-enqueues its own next run at the
+end (`_defer_until=next_poll_at`, jittered by `POLL_JITTER_FRACTION` — default
+±15% — so markets sharing a cadence tier don't all wake up in the same worker
+tick). A low-frequency cron (`enqueue_due_markets`, every 10 minutes) is a
+safety net that re-enqueues any market whose `next_poll_at` is more than 5
+minutes overdue — i.e. one whose self-scheduled job was lost to a worker
+crash or Redis eviction — rather than the primary driver of cadence.
+
 ## Stack
 
 | Layer | Choice |
@@ -45,8 +54,8 @@ go out again.
 | Queue / scheduler | arq + Redis |
 | DB + vector store | PostgreSQL + pgvector |
 | Scraping | Playwright (Chromium) |
-| LLM | OpenRouter — `openai/gpt-4o-mini` (query generation + extraction/scoring) |
-| Embeddings | OpenRouter — `openai/text-embedding-3-small` (truncated to 768 dims) |
+| LLM | Local, CPU — llama.cpp serving Qwen3-4B-Instruct-2507 (query generation + extraction/scoring). OpenAI-compatible, so pointing `LLM_BASE_URL` at OpenRouter/another provider needs no code changes — see `.env.example`. |
+| Embeddings | Local, CPU — FastEmbed/ONNX (`BAAI/bge-small-en-v1.5`, 384 dims) |
 | Search | GDELT DOC 2.0 API + Google News RSS + DuckDuckGo (best-effort) |
 
 English-only markets assumed (see `app/llm/*` system prompts and
@@ -59,30 +68,41 @@ English-only markets assumed (see `app/llm/*` system prompts and
 cp .env.example .env
 python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 # paste the output into SECRET_ENCRYPTION_KEY in .env
-# also paste an OpenRouter API key (https://openrouter.ai/keys) into OPENROUTER_API_KEY in .env
+# no LLM API key needed — the `llm` service serves a local model by default
 
 # 2. Everything
-docker compose up --build     # postgres, redis, migrate+seed, api, worker
+docker compose up --build     # postgres, redis, llm, api, worker
 ```
 
-API is on `localhost:8000`.
+API is on `localhost:8000`. **First boot downloads the LLM's ~2.5GB model
+file** (cached in the `llm_models` volume after that, so later restarts are
+fast) — the `worker` service waits on the `llm` healthcheck before starting,
+so nothing will hit it before it's actually ready.
 
 To re-run migrations/seed after a schema change: `docker compose run --rm migrate`.
 
 ## Setup (without Docker for api/worker — faster local iteration)
 
 ```bash
-docker compose up -d postgres redis
+docker compose up -d postgres redis llm
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 playwright install chromium
-cp .env.example .env   # DATABASE_URL/REDIS_URL default to localhost, already correct here
-# paste an OpenRouter API key (https://openrouter.ai/keys) into OPENROUTER_API_KEY in .env
+cp .env.example .env   # DATABASE_URL/REDIS_URL/LLM_BASE_URL default to localhost, already correct here
 alembic upgrade head
 python -m app.sources_seed
 uvicorn app.api.main:app --reload            # API
 arq app.worker.settings.WorkerSettings        # worker (separate terminal)
 ```
+
+### Using a cloud LLM instead
+
+The worker doesn't care whether `LLM_BASE_URL` points at the local `llm`
+service or a cloud provider — `LLMClient` (`app/llm/client.py`) is a plain
+OpenAI-compatible HTTP client. To go back to OpenRouter (or any other
+OpenAI-compatible API): comment out the local `LLM_*` block in `.env` and
+uncomment the OpenRouter example right below it — no code changes, and you
+can leave the `llm` container stopped since nothing else depends on it.
 
 ## API
 
@@ -130,7 +150,7 @@ updates description/resolution_date/callback/status.
 pytest
 ```
 
-Only covers pure logic (dedup, adaptive scheduling) — no live DB/OpenRouter/
+Only covers pure logic (dedup, adaptive scheduling) — no live DB/LLM/
 network calls, so it runs without any of the infra above.
 
 ## Known MVP scope cuts (intentional, not oversights)
