@@ -49,7 +49,7 @@ async def list_market_news(
     result = await session.execute(
         select(NewsItem)
         .where(NewsItem.market_id == market.id)
-        .order_by(NewsItem.discovered_at.desc())
+        .order_by(NewsItem.published_at.desc().nulls_last(), NewsItem.discovered_at.desc())
     )
     news_items = result.scalars().all()
 

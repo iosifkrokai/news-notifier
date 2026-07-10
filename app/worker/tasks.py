@@ -302,7 +302,11 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
             summary=extracted["summary"],
             proofs=extracted.get("proofs", []),
             source_domain=domain,
-            published_at=parse_published_at(candidate.get("published_at")),
+            # Prefer the search-source date; fall back to the date scraped from
+            # the article's own page metadata (see playwright_scraper/msn
+            # extractor) when the source didn't supply a usable one.
+            published_at=parse_published_at(candidate.get("published_at"))
+            or parse_published_at(scrape_result.get("published_at")),
             credibility_score=credibility,
             relevance_score=relevance,
             impact_hint=impact_hint,
