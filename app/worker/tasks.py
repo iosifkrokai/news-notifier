@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import func, select
 
 from app.config import get_settings
-from app.db.models import DeliveryLog, DeliveryStatus, ImpactHint, Market, MarketStatus, NewsItem, ScrapeFailure
+from app.db.models import DeliveryLog, DeliveryStatus, ImpactHint, Market, MarketStatus, NewsBatch, NewsItem, ScrapeFailure
 from app.db.session import async_session_factory
 from app.dedup.simhash import from_signed_64, hamming_distance, simhash, to_signed_64
 from app.dedup.vector_dedup import find_similar
@@ -21,6 +21,7 @@ from app.scraping.playwright_scraper import scrape_urls
 from app.search.aggregator import parse_published_at, search_all_sources, url_hash
 from app.security import decrypt_secret
 from app.worker.abort import register_market_job
+from app.worker.batching import _market_lock_key, create_solo_delivery, resolve_batch_candidate
 from app.worker.errors import serializable_job_errors
 from app.worker.job_ids import process_market_job_id
 
@@ -45,12 +46,6 @@ def _filter_by_recency(candidates: list[dict], max_age_days: int, now: datetime)
             kept.append(candidate)
     return kept
 
-
-def _market_lock_key(market_id: uuid.UUID) -> int:
-    """Stable signed-int8 key for pg_advisory_xact_lock, derived from the market
-    UUID. Serializes the dedup-check-and-insert of concurrent process_candidate
-    jobs for the same market so parallel workers can't slip in near-duplicates."""
-    return to_signed_64(market_id.int & ((1 << 64) - 1))
 
 # Adaptive polling: the closer resolution_date is, the more often we look.
 # Tiers are (max_time_remaining, poll_step); default_minutes is the fallback
@@ -101,8 +96,13 @@ async def process_market(ctx: dict, market_id: str) -> None:
     extraction itself — those are the slow, per-article steps that used to run
     serially in one job and blow past job_timeout on a market's first cycle
     (where every candidate is fresh). Keeping only the bounded query+search work
-    here means this job stays fast, and each article is generated (and its webhook
-    fired) independently rather than waiting on the whole batch.
+    here means this job stays fast.
+
+    All candidates selected this cycle share one NewsBatch, so the articles
+    they produce go out as a single webhook sorted by published_at instead of
+    trickling in one at a time in whatever order each async job happens to
+    finish — see app.worker.batching.resolve_batch_candidate, which every
+    process_candidate call eventually invokes.
 
     Self-schedules its own next run at the end (see the _defer_until enqueue
     below) instead of relying solely on scheduler.enqueue_due_markets polling the
@@ -158,6 +158,17 @@ async def process_market(ctx: dict, market_id: str) -> None:
             settings.poll_jitter_fraction,
         )
         next_poll_at = market.next_poll_at
+
+        # One NewsBatch per cycle, committed before any process_candidate job
+        # can start — otherwise a job could resolve and look up a batch row
+        # that doesn't exist yet.
+        batch_id: uuid.UUID | None = None
+        if selected_candidates:
+            batch = NewsBatch(market_id=market.id, expected_count=len(selected_candidates))
+            session.add(batch)
+            await session.flush()
+            batch_id = batch.id
+
         await session.commit()
 
     redis = ctx["redis"]
@@ -177,28 +188,75 @@ async def process_market(ctx: dict, market_id: str) -> None:
         # (same idea as scheduler.enqueue_due_markets), so a candidate that's slow
         # to process isn't picked up twice by the next poll tick.
         candidate_job_id = f"process_candidate:{market_id}:{candidate['canonical_url_hash']}"
-        await redis.enqueue_job("process_candidate", market_id, candidate, _job_id=candidate_job_id)
+        job = await redis.enqueue_job(
+            "process_candidate",
+            market_id,
+            candidate,
+            str(batch_id) if batch_id else None,
+            _job_id=candidate_job_id,
+        )
         # Track it so unsubscribe can abort this market's in-flight/queued
         # candidates instead of letting each one dequeue and no-op — see
         # app.worker.abort and the DELETE /markets route.
         await register_market_job(redis, market_id, candidate_job_id)
 
+        if job is None and batch_id is not None:
+            # job_id collided with a prior cycle's still-live job or its kept
+            # result (arq keeps a job's result for 1h by default) — that job's
+            # eventual resolution belongs to *that* batch, not this one. This
+            # batch still expects one slot for this candidate, so resolve it
+            # now via the same primitive every other outcome goes through,
+            # rather than leaving expected_count permanently short.
+            async with async_session_factory() as collision_session:
+                log_id = await resolve_batch_candidate(
+                    collision_session,
+                    uuid.UUID(market_id),
+                    batch_id,
+                    candidate["canonical_url_hash"],
+                    "collided_prior_cycle",
+                )
+            if log_id:
+                await redis.enqueue_job("deliver_batch", log_id, _job_id=f"deliver_batch:{log_id}")
+
 
 @serializable_job_errors
-async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
+async def process_candidate(ctx: dict, market_id: str, candidate: dict, batch_id: str | None = None) -> None:
     """Heavy per-URL job: scrape -> extract/score -> embed -> dedup -> store one
-    NewsItem, then enqueue its own single-item deliver_batch. Runs independently
-    per article so one slow/flaky LLM call can't stall (or time out) the others.
+    NewsItem, then resolve this candidate against its NewsBatch (see
+    app.worker.batching). Runs independently per article so one slow/flaky LLM
+    call can't stall (or time out) the others — the resolve() step is what
+    coalesces every candidate's outcome into a single sorted webhook per poll
+    cycle instead of one webhook per article. batch_id defaults to None so a
+    job already queued under the old 3-arg signature at deploy time falls back
+    to today's exact one-item-per-webhook behavior instead of erroring.
 
     Cross-job dedup that the old serial loop got for free (in-batch title simhash,
     incremental vector dedup) is done here against the DB under a per-market
     advisory lock, so two concurrent candidate jobs for the same market can't
     both slip in a near-duplicate."""
     settings = get_settings()
+    batch_uuid = uuid.UUID(batch_id) if batch_id else None
+
+    async def resolve(session, outcome: str, news_item_id: uuid.UUID | None = None) -> None:
+        """Record this candidate's terminal outcome and enqueue a delivery if
+        that closes/completes something to send. Commits `session`."""
+        if batch_uuid is None:
+            if news_item_id is None:
+                await session.commit()
+                return
+            log_id = await create_solo_delivery(session, uuid.UUID(market_id), news_item_id)
+            await session.commit()
+        else:
+            log_id = await resolve_batch_candidate(
+                session, uuid.UUID(market_id), batch_uuid, candidate["canonical_url_hash"], outcome, news_item_id
+            )
+        if log_id:
+            await ctx["redis"].enqueue_job("deliver_batch", log_id, _job_id=f"deliver_batch:{log_id}")
 
     async with async_session_factory() as session:
         market = await session.get(Market, uuid.UUID(market_id))
         if market is None or market.status != MarketStatus.active:
+            await resolve(session, "market_inactive")
             return
 
         scraped = await scrape_urls(
@@ -220,7 +278,7 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
                     detail=(scrape_result or {}).get("error"),
                 )
             )
-            await session.commit()
+            await resolve(session, "scrape_failed")
             return
 
         # Hash/domain must come from the post-redirect final_url, not the
@@ -238,9 +296,11 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
             logger.warning(
                 "process_candidate drop reason=extraction_error url=%s", candidate["url"], exc_info=True
             )
+            await resolve(session, "extraction_error")
             return
         if not extracted or not extracted.get("is_relevant"):
             logger.info("process_candidate drop reason=not_relevant url=%s", candidate["url"])
+            await resolve(session, "not_relevant")
             return
 
         title = extracted["title"]
@@ -252,6 +312,7 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
             logger.warning(
                 "process_candidate drop reason=embed_error url=%s", candidate["url"], exc_info=True
             )
+            await resolve(session, "embed_error")
             return
 
         # --- critical section: dedup-check-and-insert, serialized per market ---
@@ -269,6 +330,7 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
             logger.info(
                 "process_candidate drop reason=market_inactive url=%s", scrape_result["final_url"]
             )
+            await resolve(session, "market_inactive")
             return
 
         stored = (
@@ -281,6 +343,7 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
         if any(h == final_hash for h, _ in stored):
             # exact URL already stored (also guarded by uq_news_market_url)
             logger.info("process_candidate drop reason=dup_url url=%s", scrape_result["final_url"])
+            await resolve(session, "dup_url")
             return
         if any(
             s is not None
@@ -289,12 +352,14 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
         ):
             # near-duplicate title already stored for this market
             logger.info("process_candidate drop reason=dup_title url=%s", scrape_result["final_url"])
+            await resolve(session, "dup_title")
             return
 
         similar = await find_similar(session, market.id, embedding, settings.vector_dedup_threshold)
         if similar is not None:
             # semantic duplicate of a news item already stored for this market
             logger.info("process_candidate drop reason=dup_semantic url=%s", scrape_result["final_url"])
+            await resolve(session, "dup_semantic")
             return
 
         credibility = await compute_credibility(session, domain, extracted["credibility_signal"])
@@ -309,6 +374,7 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
 
         item = NewsItem(
             market_id=market.id,
+            batch_id=batch_uuid,
             url=scrape_result["final_url"],
             canonical_url_hash=final_hash,
             title_simhash=to_signed_64(title_hash),
@@ -327,28 +393,28 @@ async def process_candidate(ctx: dict, market_id: str, candidate: dict) -> None:
             embedding=embedding,
         )
         session.add(item)
-        await session.flush()
-
-        delivery_log = DeliveryLog(
-            market_id=market.id, batch_id=uuid.uuid4(), news_item_ids=[str(item.id)]
-        )
-        session.add(delivery_log)
-        await session.commit()  # releases the advisory xact lock
-        log_id = str(delivery_log.id)
+        await session.flush()  # item.id assigned, still uncommitted
         item_id = str(item.id)
 
-    logger.info(
-        "process_candidate stored news_item=%s delivery_log=%s url=%s", item_id, log_id, scrape_result["final_url"]
-    )
-    redis = ctx["redis"]
-    await redis.enqueue_job("deliver_batch", log_id)
+        # resolve()'s internal commit persists the item + its resolution (+ the
+        # finalize DeliveryLog, if this call happens to close the batch) all
+        # atomically — this replaces the old standalone
+        # `session.commit()  # releases the advisory xact lock`.
+        await resolve(session, "stored", news_item_id=item.id)
+
+    logger.info("process_candidate stored news_item=%s url=%s", item_id, scrape_result["final_url"])
 
 
 @serializable_job_errors
 async def deliver_batch(ctx: dict, delivery_log_id: str) -> None:
     """Send (or resend) the webhook for one already-stored batch. Independent
-    retry target: arq re-runs *only this* job on failure — no re-search, no
-    re-extraction, no risk of dedup silently swallowing the retry."""
+    retry target — no re-search, no re-extraction, no risk of dedup silently
+    swallowing the retry — but the retry itself does NOT come from arq: arq
+    only retries a job that explicitly raises arq.worker.Retry (see
+    app.worker.errors), and the RuntimeError raised below is a plain
+    exception, so a failed attempt here ends this job permanently. The actual
+    retry path is app.worker.scheduler.enqueue_stuck_deliveries, which sweeps
+    DeliveryLogs left at `pending` *or* `failed` and re-enqueues them."""
     settings = get_settings()
 
     async with async_session_factory() as session:
