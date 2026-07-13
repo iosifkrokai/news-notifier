@@ -74,6 +74,13 @@ class Market(Base):
     poll_interval_minutes: Mapped[int] = mapped_column(Integer, default=24 * 60)
     next_poll_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # High-water mark: the latest published_at ever included in a successfully
+    # delivered webhook for this market. process_market filters candidates
+    # older than this out of every subsequent cycle, so a late-indexed article
+    # (search sources surface it days after publication) can't land in a batch
+    # sent after a batch with newer articles already went out — see
+    # app.worker.tasks._filter_older_than_watermark.
+    max_delivered_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

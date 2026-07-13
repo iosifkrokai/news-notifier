@@ -47,6 +47,25 @@ def _filter_by_recency(candidates: list[dict], max_age_days: int, now: datetime)
     return kept
 
 
+def _filter_older_than_watermark(candidates: list[dict], watermark: datetime | None) -> list[dict]:
+    """Drop candidates published before the newest article already delivered
+    for this market. Search sources sometimes surface an article days after
+    its actual publication (late indexing) — without this, such a straggler
+    would land in today's batch even though a batch with newer articles was
+    already delivered yesterday, breaking cross-batch chronological order.
+    Candidates with a missing/unparseable published_at are kept, matching
+    _filter_by_recency's policy — losing a good article to a bad date string
+    is worse than holding it back."""
+    if watermark is None:
+        return candidates
+    kept = []
+    for candidate in candidates:
+        published_at = parse_published_at(candidate.get("published_at"))
+        if published_at is None or published_at >= watermark:
+            kept.append(candidate)
+    return kept
+
+
 # Adaptive polling: the closer resolution_date is, the more often we look.
 # Tiers are (max_time_remaining, poll_step); default_minutes is the fallback
 # for markets far from resolution / with no resolution_date at all.
@@ -135,18 +154,23 @@ async def process_market(ctx: dict, market_id: str) -> None:
         recent_candidates = _filter_by_recency(
             fresh_candidates, settings.candidate_max_age_days, datetime.now(timezone.utc)
         )
+        # Hold back anything older than what we've already delivered, so a
+        # late-indexed article can't arrive in a batch after a batch with
+        # newer articles was already sent — see _filter_older_than_watermark.
+        unstale_candidates = _filter_older_than_watermark(recent_candidates, market.max_delivered_published_at)
         selected_candidates = await select_relevant_candidates(
             market.description,
-            recent_candidates,
+            unstale_candidates,
             settings.candidate_prefilter_top_k,
             settings.candidate_prefilter_min_similarity,
         )
         logger.info(
-            "process_market market=%s candidates: found=%d fresh=%d recent=%d selected=%d",
+            "process_market market=%s candidates: found=%d fresh=%d recent=%d unstale=%d selected=%d",
             market_id,
             len(candidates),
             len(fresh_candidates),
             len(recent_candidates),
+            len(unstale_candidates),
             len(selected_candidates),
         )
 
@@ -471,6 +495,15 @@ async def deliver_batch(ctx: dict, delivery_log_id: str) -> None:
             log.delivered_at = datetime.now(timezone.utc)
             for item in items:
                 item.delivered = True
+            # Advance the watermark so future cycles hold back anything older
+            # than the newest article just delivered — see
+            # app.worker.tasks._filter_older_than_watermark. Undated items
+            # don't move it (nothing to compare against).
+            newest = max((i.published_at for i in items if i.published_at is not None), default=None)
+            if newest is not None and (
+                market.max_delivered_published_at is None or newest > market.max_delivered_published_at
+            ):
+                market.max_delivered_published_at = newest
             await session.commit()
             return
 
