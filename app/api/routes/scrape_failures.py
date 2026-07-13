@@ -9,8 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.schemas import DomainFailureResponse
 from app.db.models import ScrapeFailure
 from app.db.session import get_session
+from app.security import require_api_key
 
-router = APIRouter(tags=["scrape-failures"])
+router = APIRouter(tags=["scrape-failures"], dependencies=[Depends(require_api_key)])
 
 SAMPLE_URLS_PER_DOMAIN = 5
 
